@@ -421,3 +421,232 @@ fn end_to_end_font_weight_and_size_reach_text_command() {
         "32px text should ink more scanlines than 16px, bold={bold_ink} normal={normal_ink}"
     );
 }
+
+// —— M-3 batch 2: 方向性边框 / 轮廓的全链路像素验证 ——
+
+/// 全链路渲染并返回原始 RGBA 像素（与 [`render_to_png`] 同管线，跳过 PNG 编码）。
+fn render_raw_pixels(html: &str, css: &str, vw: u32, vh: u32) -> (u32, Vec<u8>) {
+    let dom = muskitty_html5_parser::parse(html);
+    let parsed = parse_stylesheet(css);
+    let sheet = {
+        let mut s = from_stylesheet(&parsed);
+        s.origin = Origin::Author;
+        s
+    };
+    let styles = compute_styles_tree(&dom, &[sheet], &StyleTreeOptions::default());
+    let mut tree = build_layout_tree(&dom, &styles);
+    let layout = compute_layout(&mut tree, vw as f32, vh as f32).expect("layout should succeed");
+    let input = PaintInput {
+        dom: &dom,
+        styles: &styles,
+        layout: &layout,
+        viewport: None,
+    };
+    let commands = paint(&input);
+    let mut backend = TinySkiaBackend::new();
+    match backend.render(&commands, vw, vh, 1.0) {
+        RenderOutput::Pixels { width, data, .. } => (width, data),
+        other => panic!("expected Pixels, got {other:?}"),
+    }
+}
+
+/// 读取像素为 `(r, g, b, a)`。
+fn pixel_at(data: &[u8], width: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
+    let i = ((y * width + x) * 4) as usize;
+    (data[i], data[i + 1], data[i + 2], data[i + 3])
+}
+
+#[test]
+fn end_to_end_directional_border_only_that_side() {
+    // `border-left` 走完 cascade 简写展开 → layout 盒模型 → paint → 像素：
+    // 左边 6px 红条，其余三边与盒内保持白底
+    let (width, data) = render_raw_pixels(
+        r#"<div style="border-left: 6px solid red; width: 40px; height: 20px"></div>"#,
+        "",
+        60,
+        40,
+    );
+    assert_eq!(
+        pixel_at(&data, width, 2, 10),
+        (255, 0, 0, 255),
+        "left border"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 6, 10),
+        (255, 255, 255, 255),
+        "inside the box (right of the 6px border)"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 30, 10),
+        (255, 255, 255, 255),
+        "no right border"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 30, 25),
+        (255, 255, 255, 255),
+        "below the box"
+    );
+}
+
+#[test]
+fn end_to_end_border_box_grows_with_border() {
+    // 盒模型：content-box 下 border 使 border box 变大 → 边框外侧属于盒子
+    // （旧行为下 border 不占空间，同一像素位置不会被边框覆盖）
+    let (width, data) = render_raw_pixels(
+        r#"<div style="border: 5px solid red; width: 20px; height: 20px"></div>"#,
+        "",
+        40,
+        40,
+    );
+    // 垂直中线 y=15 处：x ∈ [0,5) 左边框，x ∈ [5,25) 内部（无背景 → 白），
+    // x ∈ [25,30) 右边框
+    assert_eq!(
+        pixel_at(&data, width, 2, 15),
+        (255, 0, 0, 255),
+        "left border"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 15, 15),
+        (255, 255, 255, 255),
+        "content"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 27, 15),
+        (255, 0, 0, 255),
+        "right border"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 32, 15),
+        (255, 255, 255, 255),
+        "outside the 30px border box"
+    );
+}
+
+#[test]
+fn end_to_end_outline_drawn_outside_box() {
+    // outline 画在 border box 之外、且不影响布局（margin:10px 让轮廓可见）
+    let (width, data) = render_raw_pixels(
+        r#"<div style="margin: 10px; width: 40px; height: 20px; outline: 3px solid blue"></div>"#,
+        "",
+        80,
+        60,
+    );
+    // border box = (10,10)-(50,30)；轮廓在其外侧 3px
+    assert_eq!(
+        pixel_at(&data, width, 30, 8),
+        (0, 0, 255, 255),
+        "outline top"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 8, 20),
+        (0, 0, 255, 255),
+        "outline left"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 52, 20),
+        (0, 0, 255, 255),
+        "outline right"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 30, 32),
+        (0, 0, 255, 255),
+        "outline bottom"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 30, 20),
+        (255, 255, 255, 255),
+        "interior"
+    );
+    assert_eq!(
+        pixel_at(&data, width, 30, 6),
+        (255, 255, 255, 255),
+        "outside outline"
+    );
+}
+
+// —— M-3 batch 3: line-height / text-transform 的全链路像素验证 ——
+
+/// 全链路渲染并返回 `(width, 墨迹行号集合, 墨迹像素数)`。
+///
+/// 墨迹 = 任一通道 < 200 的像素（白底画布 + 黑字）。
+fn render_text_ink(html: &str, vw: u32, vh: u32) -> (u32, Vec<u32>, usize) {
+    let (width, data) = render_raw_pixels(html, "body { margin: 0 }", vw, vh);
+    let mut rows = Vec::new();
+    let mut ink = 0usize;
+    for y in 0..vh {
+        let mut row_has_ink = false;
+        for x in 0..width {
+            let i = ((y * width + x) * 4) as usize;
+            if data[i] < 200 || data[i + 1] < 200 || data[i + 2] < 200 {
+                row_has_ink = true;
+                ink += 1;
+            }
+        }
+        if row_has_ink {
+            rows.push(y);
+        }
+    }
+    (width, rows, ink)
+}
+
+#[test]
+fn end_to_end_line_height_moves_second_line_down() {
+    // 同一段换行文本：line-height 60px 时后续行明显下移，默认 1.2em=19.2px
+    // 更紧凑。换行行数与行高无关，故最底墨迹行号的差值直接反映行高注入
+    // （layout 测量与 renderer 绘制都取自同一份使用值）。
+    // 画布足够高（500px）让两种情况下所有行都完整落在画布内——否则高行高
+    // 的末行会被画布裁掉，墨迹像素数比较就失去意义。
+    let text = "The quick brown fox jumps over the lazy dog";
+    let (_, rows_default, ink_default) = render_text_ink(
+        &format!(r#"<div style="width: 100px">{text}</div>"#),
+        100,
+        500,
+    );
+    let (_, rows_lh60, ink_lh60) = render_text_ink(
+        &format!(r#"<div style="width: 100px; line-height: 60px">{text}</div>"#),
+        100,
+        500,
+    );
+    let last_default = *rows_default.last().expect("default text must ink");
+    let last_lh60 = *rows_lh60.last().expect("line-height text must ink");
+    assert!(
+        rows_default.len() > 5 && rows_lh60.len() > 5,
+        "both cases should wrap into several lines: default={} lh60={}",
+        rows_default.len(),
+        rows_lh60.len()
+    );
+    assert!(
+        last_lh60 > last_default + 40,
+        "60px line-height must push the last line well below the 19.2px default: \
+         last_lh60={last_lh60} last_default={last_default}"
+    );
+    // 同样的文本、同样的字形量、同样多的有效行 → 墨迹像素量接近
+    // （行高只挪位置，不改内容与字形）
+    let ratio = ink_lh60 as f64 / ink_default as f64;
+    assert!(
+        (0.9..1.1).contains(&ratio),
+        "line-height must move glyphs, not restyle them: ink ratio={ratio}"
+    );
+}
+
+#[test]
+fn end_to_end_text_transform_changes_rendered_glyphs() {
+    // uppercase 改变用于排版与绘制的文本 → 同串的墨迹不同（不同字形）。
+    // 不断言墨迹多少/行高方向：那取决于字体对大小写的设计（goal.md 已记
+    // 「像素断言只用不等性与位置，不用字体相关的量值比较」）。
+    let (_, _rows_none, ink_none) = render_text_ink(
+        r#"<div style="width: 300px; font-size: 32px">hello world</div>"#,
+        300,
+        80,
+    );
+    let (_, _rows_upper, ink_upper) = render_text_ink(
+        r#"<div style="width: 300px; font-size: 32px; text-transform: uppercase">hello world</div>"#,
+        300,
+        80,
+    );
+    assert!(ink_none > 0 && ink_upper > 0, "both cases must ink");
+    assert_ne!(
+        ink_none, ink_upper,
+        "uppercase glyphs must not produce pixel-identical ink (none={ink_none}, upper={ink_upper})"
+    );
+}

@@ -9,19 +9,20 @@
 //!   转换为 tiny-skia 的 [`tiny_skia::Color`]（也是非预乘）后由 fill_rect /
 //!   stroke_path 内部完成预乘。
 //!
-//! # 边框绘制
+//! # 边框 / 轮廓绘制
 //!
-//! - CSS border-box 外边缘 = `Rect { x, y, width, height }`
-//! - stroke 默认沿路径中心对齐（一半在内，一半在外）。为了让 stroke
-//!   完全位于 border-box 内（不超出元素外缘），构造一个内缩
-//!   `border.width / 2` 的 path 再描边。
-//! - dashed / dotted 样式当前按 solid 渲染（推迟到 tiny-skia 的 dash
-//!   支持接入）。
+//! - CSS border box 外边缘 = `Rect { x, y, width, height }`（taffy 布局结果
+//!   即 border box，见 layout `style_map`）
+//! - 四边各自填充一条 border box 内缘的矩形条：上/下取全长，左/右纵向内缩
+//!   上/下边宽度（corner 方块拼接，非浏览器的 miter 斜接）
+//! - 轮廓绘制在 border box **之外**（`outline-offset` 固定 0）
+//! - dashed / dotted / double / groove / ridge / inset / outset 当前按 solid
+//!   渲染（各自需 dash 模式 / 分线 / 明暗合成）
 
 use cosmic_text::{
     Attrs, Buffer, Command, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
 };
-use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, Rect, Transform};
 
 use crate::backend::{Backend, RenderOutput};
 use crate::color::Color;
@@ -157,7 +158,7 @@ impl Backend for TinySkiaBackend {
                     }
                     // RN-1：无背景且无边框的矩形不产生任何绘制，跳过
                     // （同时免去 Mask 构建）。
-                    let has_border = border.as_ref().is_some_and(|b| b.width > 0.0);
+                    let has_border = border.as_ref().is_some_and(|b| !b.is_empty());
                     if background.is_none() && !has_border {
                         continue;
                     }
@@ -180,12 +181,45 @@ impl Backend for TinySkiaBackend {
                         }
                     }
 
-                    // 绘制边框
+                    // 绘制四边边框
                     if let Some(b) = border {
-                        if b.width > 0.0 {
-                            draw_border(&mut pixmap, *x, *y, *width, *height, b, scale, clip);
+                        if !b.is_empty() {
+                            draw_borders(&mut pixmap, *x, *y, *width, *height, b, scale, clip);
                         }
                     }
+                }
+                RenderCommand::Outline {
+                    x,
+                    y,
+                    width,
+                    height,
+                    outline_width,
+                    color,
+                    style,
+                } => {
+                    if *width <= 0.0 || *height <= 0.0 || *outline_width <= 0.0 {
+                        continue;
+                    }
+                    // RN-1：实际消费 clip 时才懒构建 Mask。
+                    let clip = clip_mask_for(
+                        &pixmap,
+                        clip_rect,
+                        &mut clip_mask,
+                        &mut mask_built_for,
+                        scale_xform,
+                    );
+                    draw_outline(
+                        &mut pixmap,
+                        *x,
+                        *y,
+                        *width,
+                        *height,
+                        *outline_width,
+                        *color,
+                        *style,
+                        scale,
+                        clip,
+                    );
                 }
                 RenderCommand::Text {
                     x,
@@ -193,6 +227,7 @@ impl Backend for TinySkiaBackend {
                     width,
                     text,
                     font_size,
+                    line_height,
                     font_family,
                     font_weight,
                     text_align,
@@ -215,6 +250,7 @@ impl Backend for TinySkiaBackend {
                         *width,
                         text,
                         *font_size,
+                        *line_height,
                         font_family,
                         *font_weight,
                         *text_align,
@@ -306,9 +342,14 @@ fn clip_mask_for<'a>(
     clip_mask.as_ref()
 }
 
-/// 绘制矩形边框（沿 border-box 内边缘描边）。
+/// 绘制四边边框（每个可见边填充一条 border box 内缘的矩形条）。
+///
+/// 与旧的 inset-rect stroke 相比（M-3 batch 2）：四边可以有各自的宽/色/样式。
+/// corner 处理为**方块拼接**——上/下边取全长，左/右边纵向内缩上/下边宽度；
+/// 浏览器对相邻不同宽度的边用 miter 斜接（梯形），此处为已记录近似。
+/// dashed/dotted/double 与明暗类（groove/ridge/inset/outset）按 solid 近似。
 #[allow(clippy::too_many_arguments)]
-fn draw_border(
+fn draw_borders(
     pixmap: &mut Pixmap,
     x: f32,
     y: f32,
@@ -318,47 +359,77 @@ fn draw_border(
     scale: f32,
     clip_mask: Option<&Mask>,
 ) {
-    let half = border.width / 2.0;
+    let (top, right, bottom, left) = border.widths();
+    // 左右边纵向内缩上/下边宽度（corner 归上/下所有）
+    let inner_h = (height - top - bottom).max(0.0);
 
-    // 内缩半个边框宽度，使 stroke 完全位于 border-box 内
-    let inner = Rect::from_xywh(
-        x + half,
-        y + half,
-        width - border.width,
-        height - border.width,
-    );
-
-    let rect = match inner {
-        Some(r) => r,
-        None => return, // 边框宽度大于元素尺寸 → 无法绘制
-    };
-
-    let path = PathBuilder::from_rect(rect);
-
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(
-        border.color.r,
-        border.color.g,
-        border.color.b,
-        border.color.a,
-    );
-    paint.anti_alias = true;
-
-    // W-2：stroke 宽度保持逻辑 px（tiny-skia 在局部空间描边后再应用
-    // transform，见 painter.rs 的 `path.stroke` → `fill_path(transform)`），
-    // 缩放由 scale_xform 完成；此处只放大路径坐标。
-    let stroke = Stroke {
-        width: border.width,
-        ..Default::default()
-    };
-    let scale_xform = Transform::from_scale(scale, scale);
-
-    // dashed / dotted 当前按 solid 渲染（推迟 dash 模式接入）
-    match border.style {
-        BorderStyle::Solid | BorderStyle::Dashed | BorderStyle::Dotted => {
-            pixmap.stroke_path(&path, &paint, &stroke, scale_xform, clip_mask);
+    let mut fill = |bx: f32, by: f32, bw: f32, bh: f32, side: crate::command::SideBorder| {
+        if bw <= 0.0 || bh <= 0.0 || side.width <= 0.0 {
+            return;
         }
-        BorderStyle::None => {} // 已在外层过滤
+        let Some(rect) = Rect::from_xywh(bx, by, bw, bh) else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(side.color.r, side.color.g, side.color.b, side.color.a);
+        // 整数宽度走无抗锯齿填充（边缘落在像素边界，避免半透明毛边）；
+        // 亚像素宽度（如 0.5px）开抗锯齿，否则会被吸附成 1px 或消失。
+        paint.anti_alias = side.width.fract() != 0.0;
+        pixmap.fill_rect(rect, &paint, Transform::from_scale(scale, scale), clip_mask);
+    };
+
+    if let Some(side) = border.top {
+        fill(x, y, width, top, side);
+    }
+    if let Some(side) = border.bottom {
+        fill(x, y + height - bottom, width, bottom, side);
+    }
+    if let Some(side) = border.left {
+        fill(x, y + top, left, inner_h, side);
+    }
+    if let Some(side) = border.right {
+        fill(x + width - right, y + top, right, inner_h, side);
+    }
+}
+
+/// 绘制轮廓（CSS UI Level 4 §4，M-3 batch 2）：border box **外侧**四条矩形条。
+///
+/// `outline-offset` 未实现（固定 0），故轮廓紧贴 border box 外缘向外展开
+/// `outline_width`。轮廓不参与布局（由 layout 层保证：map_style 不读 outline）。
+#[allow(clippy::too_many_arguments)]
+fn draw_outline(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    outline_width: f32,
+    color: Color,
+    style: BorderStyle,
+    scale: f32,
+    clip_mask: Option<&Mask>,
+) {
+    if !style.is_painted() || outline_width <= 0.0 {
+        return;
+    }
+    let ow = outline_width;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    paint.anti_alias = ow.fract() != 0.0;
+    let xform = Transform::from_scale(scale, scale);
+
+    // 上/下取全长并向左右各外扩 ow；左/右纵向只覆盖 border box 高度，
+    // 四条拼成闭合环（corner 归上/下所有，同 border 的方块拼接近似）。
+    let strips = [
+        (x - ow, y - ow, width + 2.0 * ow, ow),     // top
+        (x - ow, y + height, width + 2.0 * ow, ow), // bottom
+        (x - ow, y, ow, height),                    // left
+        (x + width, y, ow, height),                 // right
+    ];
+    for (sx, sy, sw, sh) in strips {
+        if let Some(rect) = Rect::from_xywh(sx, sy, sw, sh) {
+            pixmap.fill_rect(rect, &paint, xform, clip_mask);
+        }
     }
 }
 
@@ -375,6 +446,7 @@ fn draw_text(
     width: f32,
     text: &str,
     font_size: f32,
+    line_height: f32,
     font_family: &str,
     font_weight: u16,
     text_align: TextAlign,
@@ -384,7 +456,9 @@ fn draw_text(
     swash_cache: &mut SwashCache,
     clip_mask: Option<&Mask>,
 ) {
-    let line_height = font_size * 1.2;
+    // M-3 batch 3：行高来自 Text 命令（cascade `used_line_height_px` 的使用值），
+    // 不再用 `font_size * 1.2` —— 与 layout 测量的行高一致，否则绘制行位置
+    // 与布局盒高对不上（T-3 的"汉字位移"教训）。
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
     // 按布局宽度换行（T-3）。
     buffer.set_size(font_system, Some(width), None);
@@ -462,7 +536,7 @@ fn family_from_css(name: &str) -> Family<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RenderCommand;
+    use crate::command::{RenderCommand, SideBorder};
     use crate::Color;
 
     /// 渲染并取出 RGBA 像素数据（width, height, data）。
@@ -502,6 +576,7 @@ mod tests {
             width: 200.0,
             text: "T".to_string(),
             font_size: 64.0,
+            line_height: 64.0 * 1.2,
             font_family: "serif".to_string(),
             font_weight: 400,
             text_align: TextAlign::Left,
@@ -565,6 +640,7 @@ mod tests {
             width: 200.0,
             text: "Hello".to_string(),
             font_size: 24.0,
+            line_height: 24.0 * 1.2,
             font_family: "serif".to_string(),
             font_weight: 400,
             text_align: TextAlign::Left,
@@ -634,6 +710,61 @@ mod tests {
         assert_eq!(a, 255);
     }
 
+    // —— M-3 batch 3: Text 命令的 line_height 决定多行位置 ——
+
+    /// 渲染单条 Text 命令并返回「最底部墨迹行号」。
+    fn last_ink_row(text: &str, font_size: f32, line_height: f32, width: f32) -> (u32, usize) {
+        let cmds = vec![RenderCommand::Text {
+            x: 0.0,
+            y: 0.0,
+            width,
+            text: text.to_string(),
+            font_size,
+            line_height,
+            font_family: "serif".to_string(),
+            font_weight: 400,
+            text_align: TextAlign::Left,
+            color: Color::rgb(0, 0, 0),
+        }];
+        let mut backend = TinySkiaBackend::new();
+        let (w, h, data) = render_pixels(&mut backend, &cmds, 60, 160, 1.0);
+        // 自下而上找首个含墨迹的行（clippy 1.98 不再接受 filter(..).next_back()）
+        let last = (0..h)
+            .rev()
+            .find(|&y| {
+                (0..w).any(|x| {
+                    let i = ((y * w + x) * 4) as usize;
+                    data[i] < 200
+                })
+            })
+            .unwrap_or(0) as usize;
+        (w, last)
+    }
+
+    #[test]
+    fn text_line_height_controls_multiline_positions() {
+        // 同一文本在同一宽度下换行（行数由换行决定，与行高无关）；行高只
+        // 影响各行纵向位置——行高 40 的第二行必须落在行高 10 的下方。
+        // 这是 backend 侧对「line_height 来自 Text 命令」的直接断言（此前
+        // 后端硬编码 `font_size * 1.2`，三处行高必然相同）。
+        let text = "one two three four five six";
+        let (_, small) = last_ink_row(text, 10.0, 10.0, 40.0);
+        let (_, normal) = last_ink_row(text, 10.0, 12.0, 40.0);
+        let (_, big) = last_ink_row(text, 10.0, 40.0, 40.0);
+        assert!(
+            small > 0 && normal > 0,
+            "wrapped text must ink multiple rows (small={small}, normal={normal})"
+        );
+        assert!(
+            big >= small + 20,
+            "40px line-height must push the last line far below the 10px case: big={big} small={small}"
+        );
+        assert!(
+            big > normal,
+            "40px line-height must exceed the 12px (1.2em) default: big={big} normal={normal}"
+        );
+    }
+
     // —— F-10: 裁剪栈有界化 ——
 
     #[test]
@@ -659,6 +790,7 @@ mod tests {
             width: 40.0,
             text: "T".to_string(),
             font_size: 12.0,
+            line_height: 12.0 * 1.2,
             font_family: "serif".to_string(),
             font_weight: 400,
             text_align: TextAlign::Left,
@@ -862,11 +994,11 @@ mod tests {
             width: 80.0,
             height: 60.0,
             background: None,
-            border: Some(Border {
-                width: 2.0,
-                color: Color::rgb(0, 0, 255),
-                style: BorderStyle::Solid,
-            }),
+            border: Some(Border::uniform(
+                2.0,
+                Color::rgb(0, 0, 255),
+                BorderStyle::Solid,
+            )),
         }];
         let (width, _, data) = render_pixels(&mut backend, &cmds, 100, 100, 1.0);
 
@@ -875,11 +1007,106 @@ mod tests {
         assert_eq!(a, 255, "outside border should be white canvas");
         assert_eq!(r, 255, "white canvas");
 
-        // 边框中心像素 (y=10) 应为蓝色
-        // stroke 中心对齐到 (x+1, y+1)，所以 (50, 10) 应在边框顶部
+        // 边框占据 border box 内缘的矩形条：y ∈ [10,12) 为顶部边框
         let (_, _, b, a) = pixel(&data, width, 50, 10);
         assert_eq!(a, 255, "border should be opaque");
         assert_eq!(b, 255, "border should be blue");
+        let (_, _, b, _) = pixel(&data, width, 50, 11);
+        assert_eq!(b, 255, "2px-wide top border covers the second row too");
+        // 内缩 2px 之后是盒子内部（无背景 → 白底）
+        let (r, _, _, _) = pixel(&data, width, 50, 12);
+        assert_eq!(r, 255, "interior without background stays white canvas");
+    }
+
+    #[test]
+    fn render_directional_border_only_on_that_side() {
+        // M-3 batch 2: 仅左边框 → 只有最左列条着色
+        let mut backend = TinySkiaBackend::new();
+        let cmds = vec![RenderCommand::Rect {
+            x: 10.0,
+            y: 10.0,
+            width: 30.0,
+            height: 20.0,
+            background: None,
+            border: Some(Border {
+                left: Some(SideBorder {
+                    width: 4.0,
+                    color: Color::rgb(255, 0, 0),
+                    style: BorderStyle::Solid,
+                }),
+                ..Border::default()
+            }),
+        }];
+        let (width, _, data) = render_pixels(&mut backend, &cmds, 100, 100, 1.0);
+
+        // 左 4px 条：x ∈ [10,14) 红
+        assert_eq!(pixel(&data, width, 10, 20), (255, 0, 0, 255), "left border");
+        assert_eq!(pixel(&data, width, 13, 20), (255, 0, 0, 255), "left border");
+        // 顶部/右边/内部均无边框 → 白底
+        assert_eq!(
+            pixel(&data, width, 20, 10),
+            (255, 255, 255, 255),
+            "no top border"
+        );
+        assert_eq!(
+            pixel(&data, width, 39, 20),
+            (255, 255, 255, 255),
+            "no right border"
+        );
+        assert_eq!(
+            pixel(&data, width, 20, 20),
+            (255, 255, 255, 255),
+            "interior"
+        );
+    }
+
+    #[test]
+    fn render_outline_rings_outside_the_box() {
+        // M-3 batch 2: outline 画在 border box 外侧（不占布局）
+        let mut backend = TinySkiaBackend::new();
+        let cmds = vec![RenderCommand::Outline {
+            x: 20.0,
+            y: 20.0,
+            width: 40.0,
+            height: 30.0,
+            outline_width: 3.0,
+            color: Color::rgb(0, 128, 0),
+            style: BorderStyle::Solid,
+        }];
+        let (width, _, data) = render_pixels(&mut backend, &cmds, 100, 100, 1.0);
+
+        // 上边框条：y ∈ [17,20) 绿（盒子上方）
+        assert_eq!(pixel(&data, width, 40, 17), (0, 128, 0, 255), "outline top");
+        assert_eq!(pixel(&data, width, 40, 19), (0, 128, 0, 255), "outline top");
+        // 下边框条：y ∈ [50,53)
+        assert_eq!(
+            pixel(&data, width, 40, 50),
+            (0, 128, 0, 255),
+            "outline bottom"
+        );
+        // 左右条：x ∈ [17,20) 与 [60,63)
+        assert_eq!(
+            pixel(&data, width, 17, 30),
+            (0, 128, 0, 255),
+            "outline left"
+        );
+        assert_eq!(
+            pixel(&data, width, 60, 30),
+            (0, 128, 0, 255),
+            "outline right"
+        );
+        // 盒子内部不受轮廓影响 → 白底
+        assert_eq!(
+            pixel(&data, width, 40, 30),
+            (255, 255, 255, 255),
+            "interior"
+        );
+        // 轮廓之外仍是白底
+        assert_eq!(
+            pixel(&data, width, 40, 16),
+            (255, 255, 255, 255),
+            "above outline"
+        );
     }
 
     #[test]
@@ -976,36 +1203,39 @@ mod tests {
     }
 
     #[test]
-    fn render_scale_scales_border_stroke() {
-        // 边框 stroke 在局部空间描边后随 transform 缩放（painter.rs 先
-        // `path.stroke` 再 `fill_path(transform)`）：scale=2 时逻辑 2px 边框
-        // → 物理 4px（比 scale=1 的 2px 宽一倍）。
-        let border = Border {
-            width: 2.0,
-            color: Color::rgb(0, 0, 255),
-            style: BorderStyle::Solid,
-        };
+    fn render_scale_scales_border() {
+        // 边框矩形条在逻辑空间填充后随 transform 缩放：scale=2 时逻辑 2px
+        // 边框 → 物理 4px（scale=1 的 2px 宽一倍）。
         let cmds = vec![RenderCommand::Rect {
             x: 10.0,
             y: 10.0,
             width: 80.0,
             height: 60.0,
             background: None,
-            border: Some(border),
+            border: Some(Border::uniform(
+                2.0,
+                Color::rgb(0, 0, 255),
+                BorderStyle::Solid,
+            )),
         }];
 
         let mut backend = TinySkiaBackend::new();
         let (w2, _, d2) = render_pixels(&mut backend, &cmds, 100, 100, 2.0);
         assert_eq!(w2, 200);
 
-        // 内缩路径物理 y = (10+1)*2 = 22，stroke 半宽 2px → 覆盖 y ∈ [20,24]。
+        // 顶部边框物理覆盖 y ∈ [20,24)（逻辑 y=10 → 物理 20，高 2 逻辑 px → 4 物理 px）
         assert_eq!(
-            pixel(&d2, w2, 100, 21),
+            pixel(&d2, w2, 100, 20),
             (0, 0, 255, 255),
             "border top edge at 2x"
         );
         assert_eq!(
-            pixel(&d2, w2, 100, 30),
+            pixel(&d2, w2, 100, 23),
+            (0, 0, 255, 255),
+            "border top edge at 2x (last physical row)"
+        );
+        assert_eq!(
+            pixel(&d2, w2, 100, 24),
             (255, 255, 255, 255),
             "interior without background stays white canvas"
         );
