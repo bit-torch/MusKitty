@@ -1,3 +1,52 @@
+# Goal — 2026-09-25 规范向测试补全轮（规范已有、夹具陈旧）
+
+> **状态**：✅ 已完成（T-1/T-2/T-3 全部落地，退出条件逐一满足；详见下方完成记录）
+> **请求**：给"规范已有但 WPT 夹具仍旧"的部分补全规范向测试（符合 WHATWG 期望，不迁就夹具），
+> **不联网**，只用本地 `docs/spec/` 下的规范文本。
+> **判据来源**：`docs/spec/WHATWG/html/15-13the-html-syntax.md`
+> （§13.2.5.72–76 处理指令五态；§13.2.6.4.7 input start tag 的 fragment+select 分支）。
+
+## P0（已修）
+
+| # | 问题 | 位置 | 退出条件 | 状态 |
+|---|---|---|---|---|
+| T-1 | PI token 被 harness 静默丢弃；旧夹具把 `<?…` 期望成 `Comment` | `html5-tokenizer/tests/html5lib_tokenizer.rs` | PI token 显式断言；陈旧夹具入 `STALE_FIXTURES` 并附规范引用；非陈旧用例硬门禁 | ✅ |
+| T-2 | `<input>` 起标签缺 fragment-case + `select` 上下文早退 | `html5-parser/src/parser/dispatch.rs` `handle_in_body_start_tag` | 上下文元素不在开放元素栈上，故须直读 `fragment_context`；`tests_innerHTML_1.dat` #76 由 FAILED → pass | ✅ |
+| T-3 | tree-construction harness 只断言 `total > 0`，失败不阻断 | `html5-parser/tests/html5lib_tree_construction.rs` | 收紧为 `total_fail == 0` 硬门禁，与 tokenizer 口径一致 | ✅ |
+
+## 完成记录（2026-09-25 轮）
+
+| # | 落点 | 提交 |
+|---|------|------|
+| T-1 | 新增 `tests/data/tokenizer/processing-instruction.test`（29 例，覆盖 §13.2.5.72–76 五态：歧义目标 `xml`/`xml-stylesheet` 降级为 bogus comment、各态 EOF、非法首字符、可选尾 `?`）；harness 的 PI 分支由静默丢弃改为断言 `["ProcessingInstruction", target, data]` | tokenizer 仓库 `4efb610` |
+| T-2 | `input` 起标签按 §13.2.6.4.7 增加 fragment-case + `select` 上下文早退；补 4 条规范引用单测（select fragment 忽略 / `type=hidden` 不改变结果 / div fragment 正常插入 / select 在栈上的 pop 路径） | parser 仓库 `fb3bde9`（0.2.2 → 0.2.3） |
+| T-3 | tree-construction harness 软断言 → `total_fail == 0` 硬门禁；gap report 同步 | parser 仓库 `fb3bde9` |
+| — | `Cargo.lock` 随版本号同步 | 主仓库 `922c5fe` |
+
+**退出条件核验**：
+- tokenizer：`cargo test` 全绿（149 lib + 1 suite）；html5lib 套件 **7051/7051 = 100.0%**，
+  14 例陈旧夹具已显式列名并附规范引用（规范 > 夹具），不再计入失败。
+- parser：`cargo test` 全绿（44 lib + 1 suite + 3 + 72）；html5lib tree-construction
+  **1924/1924 = 100.0%**（14 例 `#script-on` 跳过；本轮起失败即硬失败）。
+- 两 crate `cargo clippy --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 干净；
+  主仓库 `cargo check --workspace` 干净。
+
+## 显式非目标（本轮不做）
+
+- 不修改任何夹具的既有期望值以迁就实现；与现行规范冲突者一律登记为陈旧并保留实现。
+- `xmlViolationTests`（infoset 强制转换）不实现——属 XML 解析器侧要求，HTML 解析器不承担。
+- 其余存量 P1/P2/P3（见 [docs/audit-2026-09-06-vuln-arch-perf.md](docs/audit-2026-09-06-vuln-arch-perf.md)）不在本轮。
+
+## 复跑命令
+
+```bash
+cd crates/muskitty-html5-tokenizer && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --all -- --check
+cd crates/muskitty-html5-parser   && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --all -- --check
+cd /workspace && cargo check --workspace
+```
+
+---
+
 # Goal — 2026-09-24 接线与收口轮（接线 cascade + 消除文档失真）
 
 > **状态**：✅ 已完成（B-1~B-7 全部落地，退出条件逐一满足；详见下方完成记录）
@@ -81,7 +130,7 @@ cd /workspace && cargo test --workspace && cargo clippy --workspace --all-target
 | C-1 | Critical | PNG 解码炸弹：解码前无尺寸上限，远程页面可 OOM abort | renderer image.rs | IHDR 预检 + 回归测试（大尺寸 PNG 返回 None） |
 | H-1 | High | 实体解析入口不清 temporary_buffer，`</title x>&amp;` 输出损坏 | html5-tokenizer | failing→pass 测试 + html5lib 全绿 |
 | H-2 | High | build_attribute `&name[3..]` 应为 `[1..]`，foreign 属性 prefix 损坏 | html5-parser foreign.rs | failing→pass 测试（xlink:href prefix 正确） |
-| H-3 | High | foreign start tag 用 current_node 而非 adjusted current node | html5-parser foreign.rs | foreign-fragment.dat 失败数显著下降 + 全绿 |
+| H-3 | High | foreign start tag 用 current_node 而非 adjusted current node | html5-parser foreign.rs | ✅ 2026-09-25 已修（0.2.2）：`process_start_tag_in_foreign` 改读 `adjusted_current_node()`，`foreign-fragment.dat` 48/66 → 66/66，套件 1923/1924 |
 | H-4 | High | `! important`（带空白）丢失 important 且污染值 | css-parser algorithms.rs | failing→pass（`color: red ! important`） |
 | H-5 | High | replace_child 缺 pre-insert 校验可造父子环 | dom tree.rs | 祖先替换抛 HierarchyRequestError 测试 |
 | H-6 | High | insert_before 同父移动陈旧索引 | dom tree.rs | `[A,B,C]`+insertBefore(A,C)→`[B,A,C]` 测试 |
@@ -192,6 +241,28 @@ cd /workspace && cargo fmt --all -- --check
 
 > **状态**：✅ 已完成（W-3b + html5-parser 补齐，报告已重生成并重发布）。
 > **实测（重跑基线各 crate harness）**：整体 **9592/9610 = 99.83%**。
+>
+> ⚠️ **现值勘误（2026-09-26）**：下表为本轮历史快照，数字已被后续两轮取代。现行口径见
+> [PROGRESS.md](PROGRESS.md) crate 表与 `.wpt-report/report/index.html`：html5-tokenizer
+> **7051/7051 = 100.0%**（PI 态测试补齐）、html5-parser **1924/1924 = 100.0%**（§13.2.6.4.7
+> input fragment+select 早退），整体 **9624/9625 = 99.99%**（1 例 css-selectors 保留偏差、
+> 14 例 `#script-on` 跳过）。
+>
+> ⚠️ **勘误（2026-09-25 复跑 + 修复）**：上行的 99.83% 及本表 `muskitty-html5-parser`
+> 的 1921/1924 当时**不可复现**。2026-09-25 在检出（本地 `crates/muskitty-html5-parser`
+> 与远端 `muskitty-dev/muskitty-html5-parser` main 同为 `ba065b8` / tag `v0.2.1`）
+> 上重跑 `html5lib_tree_construction`，实测 **1905/1924 = 99.0%**（`foreign-fragment.dat`
+> 48/66，18 例失败）。即当轮所称的"① fragment 语境外用 `adjusted_current_node()`"修复
+> 从未进入任何已提交对象——与 2026-09-24 审计查出的 cascade 幽灵 commit
+> （`58efc45`/`fea6b84`/`7d86720`）属同一失真模式。
+>
+> **已按审计 H-3 真正修复（2026-09-25，`muskitty-html5-parser` 0.2.1 → 0.2.2）**：
+> `foreign.rs::process_start_tag_in_foreign` 的命名空间取自 `parser.current_node()`
+> （fragment 场景下栈顶是合成 `<html>` 根）→ 改用 §13.2.4 的 `adjusted_current_node()`
+> （fragment 场景下即上下文元素）。`foreign-fragment.dat` **48/66 → 66/66**，套件
+> **1905/1924 → 1923/1924 = 99.9%**，仅余 `tests_innerHTML_1.dat` #76（规范>夹具保留偏差）。
+> 本轮实测整体 **9594/9610 = 99.83%**。现行口径以 [PROGRESS.md](PROGRESS.md) crate 表与
+> `.wpt-report/report/index.html` 为准。
 
 ## 本轮修复（按 crate）
 
@@ -199,23 +270,33 @@ cd /workspace && cargo fmt --all -- --check
 |-------|-----------:|------|
 | muskitty-css-tokenizer | 已有 → 100% (99/99) | `Numeric` 暴露 `has_sign`（§4.3.13），供 An+B 判符号 |
 | muskitty-selectors | 94.3% (479/508) → **99.8% (507/508)** | W-3b：`an_plus_b.rs` 按 `<signed-integer>`/`<signless-integer>` 拒带符号位（`n 5`、`n- +5`、`5n + +5`、`n-+1` 等 27 例） |
-| muskitty-html5-parser | 97.6% (1905/1924) → **99.8% (1921/1924)** | ① fragment 语境外用 `adjusted_current_node()` 而非栈顶取命名空间——修 18 例 foreign-fragment.dat 将 SVG/MathML 子元素误入 HTML 命名空间；② 新增 in-select / in-select-in-table 插入模式强化 select 内容模型 |
+| muskitty-html5-parser | 97.6% (1905/1924) → **99.9% (1923/1924)** | fragment 语境外用 `adjusted_current_node()` 而非栈顶取命名空间——修 18 例 foreign-fragment.dat 将 SVG/MathML 子元素误入 HTML 命名空间（2026-09-25 真正落地，见上方勘误） |
 | muskitty-html5-tokenizer | 已有 → 99.8% (7022/7036) | （`<?` 处理指令/注释等已按 HTML5 判定合规） |
 | muskitty-css-parser | 已有 → 100% (27/27) | — |
 | muskitty-css-values | 已有 → 16/16 | — |
 
 ## 保留的记录偏差（合规范、不合旧夹具）
 
-3 例 tree-construction 失败属**夹具陈旧 × 现行 WHATWG 规范**分歧，按仓库
+1 例 tree-construction 失败属**夹具陈旧 × 现行 WHATWG 规范**分歧，按仓库
 "规范>测试"约定保留实现、不迁就夹具（规范 2026 现行文本已核对）：
-- `tests_innerHTML_1.dat` #77 `<keygen><option>`、#78 `<textarea><option>`（fragment 源
-  `select`）：夹具预期 keygen/textarea 被插入 select 内；现行规范 §13.2.6.15
-  "in select" 明确 `input`/`keygen`/`textarea` start tag = parse error + **忽略**。
-- `webkit02.dat` #19 里元素名 `xh<optgroup`：legacy webkit 解析器产物；现行 tokenizer
-  不会产出含 `<` 的标签名，属规范之外的废名，不可复刻。
+- `tests_innerHTML_1.dat` #76 `<input><option>`（fragment 源 `select`）：夹具预期
+  `input` 被插入 select 内；现行规范 §13.2.6.15 "in select" 明确 `input` start tag
+  = parse error + **忽略**，故 `input` 按 InBody 插入。
+  （#77 `<keygen><option>`、#78 `<textarea><option>` 与 `webkit02.dat` #19 `xh<optgroup`
+  于 2026-09-25 复跑时已通过，不再是保留偏差。）
+
+> ⚠️ **勘误（2026-09-26）**：上一段所引的规范条款号有误——现行 WHATWG 文本中
+> **"in select" 插入模式已被删除**（`reset_insertion_mode` 亦无 select 分支），
+> 该行为改由 **§13.2.6.4.7 "in body" 的 `input` start tag** 承载：当
+> `fragment_context` 是 HTML 命名空间的 `select` 时 parse error、忽略 token 并返回。
+> 因此 #76 不是"保留偏差"，而是本侧实现漏了 fragment 分支；已在 2026-09-25
+> （parser 0.2.2 → 0.2.3）按该条款补齐并转为 **pass**，tree-construction 套件
+> **1924/1924 = 100.0%**，parser 侧保留偏差清零。详见本文件顶部的本轮记录与
+> [PROGRESS.md](PROGRESS.md) crate 表。
 
 ## 部署
 
 - 报告重新生成：`.wpt-report/report/index.html`；部署目录 `.wpt-report/deploy/` 同步。
-- gh-pages 分支重发（`245a3c4 → 71db2b4`）：https://ink-dark.github.io/MusKitty/
-- 线上 README 套件表同步为现值（selectors 507/508、html5-parser 1921/1924）。
+- gh-pages 分支重发（`245a3c4 → 71db2b4`；2026-09-25 复跑后再次重发 `1e66b38`）：
+  https://ink-dark.github.io/MusKitty/
+- 线上 README 套件表同步为现值（selectors 507/508、html5-parser 1923/1924、整体 9594/9610）。
